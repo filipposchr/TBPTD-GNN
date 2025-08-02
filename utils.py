@@ -43,6 +43,180 @@ def temporal_adjacency_list(src_list, dst_list, ts_list, num_nodes):
     return tal
 
 
+def loss_cal(y_out, true_val, num_nodes, device):
+    _, order_y_true = torch.sort(-true_val[:num_nodes])
+
+    sample_num = num_nodes * 80
+    ind_1 = torch.randint(0, num_nodes, (sample_num,)).long().to(device)
+    ind_2 = torch.randint(0, num_nodes, (sample_num,)).long().to(device)
+
+    rank_measure = torch.sign(-1 * (ind_1 - ind_2)).float()
+
+    input_arr1 = y_out[:num_nodes][order_y_true[ind_1]].to(device)
+    input_arr2 = y_out[:num_nodes][order_y_true[ind_2]].to(device)
+
+    loss_rank = torch.nn.MarginRankingLoss(margin=1.0).forward(input_arr1, input_arr2, rank_measure)
+
+    return loss_rank
+
+def compute_topk_metrics(preds, labels, k_list=[1, 10, 20, 30], jac=True):
+    """
+    Computes:
+    - Top@k% precision = |pred ∩ true| / k
+    - Recall@k% for positives = |pred ∩ true positives| / (# true positives)
+    - Jaccard index between predicted and true positive sets
+    """
+
+    stats = {}
+    N = len(preds)
+    preds = preds.detach().cpu()
+    labels = labels.detach().cpu()
+
+    true_positive_indices = set(torch.where(labels > 0)[0].tolist())
+    num_true_positives = len(true_positive_indices)
+
+    if num_true_positives == 0:
+        for k in k_list:
+            stats[f"Top@{k}%"] = 0.0
+            stats[f"Recall@{k}%"] = 0.0
+        if jac:
+            stats["Jaccard"] = 0.0
+        return stats
+
+    result_line = []
+
+    for k in k_list:
+        topk = max(1, math.ceil(N * (k / 100)))
+        pred_topk_indices = set(torch.topk(preds, topk).indices.tolist())
+        true_topk_indices = set(torch.topk(labels, topk).indices.tolist())
+
+        # Top@k precision as originally computed
+        intersection = pred_topk_indices & true_topk_indices
+        precision_at_k = len(intersection) / topk
+        stats[f"Top@{k}%"] = precision_at_k
+
+        # NEW: Recall@k for positives
+        intersection_with_true_pos = pred_topk_indices & true_positive_indices
+        recall_at_k = len(intersection_with_true_pos) / num_true_positives
+        stats[f"Recall@{k}%"] = recall_at_k
+
+        result_line.append(f"Top@{k}%: {precision_at_k:.4f} | Recall@{k}%: {recall_at_k:.4f}")
+
+    if jac:
+        pred_full_set = set(torch.topk(preds, num_true_positives).indices.tolist())
+        union = pred_full_set | true_positive_indices
+        inter = pred_full_set & true_positive_indices
+        jaccard = len(inter) / len(union)
+        stats["Jaccard"] = jaccard
+        result_line.append(f"Jaccard: {jaccard:.4f}")
+
+    print(" | ".join(result_line))
+    return stats
+
+
+def compute_topk_metrics_ptd(preds, labels, k_list=[1, 10, 20, 30], jac=True):
+    """
+    Computes:
+    - Top@k% precision = |pred ∩ true| / k
+    - Recall@k% for positives = |pred ∩ true positives| / (# true positives)
+    - Jaccard index between predicted and true positive sets
+    """
+
+    stats = {}
+    N = len(preds)
+    preds = preds.detach().cpu()
+
+    labels = torch.tensor(labels)  # convert list to tensor
+    true_positive_indices = set(torch.where(labels > 0)[0].tolist())
+    num_true_positives = len(true_positive_indices)
+
+    if num_true_positives == 0:
+        for k in k_list:
+            stats[f"Top@{k}%"] = 0.0
+            stats[f"Recall@{k}%"] = 0.0
+        if jac:
+            stats["Jaccard"] = 0.0
+        return stats
+
+    result_line = []
+
+    for k in k_list:
+        topk = max(1, math.ceil(N * (k / 100)))
+        pred_topk_indices = set(torch.topk(preds, topk).indices.tolist())
+        true_topk_indices = set(torch.topk(labels, topk).indices.tolist())
+
+        # Top@k precision as originally computed
+        intersection = pred_topk_indices & true_topk_indices
+        precision_at_k = len(intersection) / topk
+        stats[f"Top@{k}%"] = precision_at_k
+
+        # NEW: Recall@k for positives
+        intersection_with_true_pos = pred_topk_indices & true_positive_indices
+        recall_at_k = len(intersection_with_true_pos) / num_true_positives
+        stats[f"Recall@{k}%"] = recall_at_k
+
+        result_line.append(f"Top@{k}%: {precision_at_k:.4f} | Recall@{k}%: {recall_at_k:.4f}")
+
+    if jac:
+        pred_full_set = set(torch.topk(preds, num_true_positives).indices.tolist())
+        union = pred_full_set | true_positive_indices
+        inter = pred_full_set & true_positive_indices
+        jaccard = len(inter) / len(union)
+        stats["Jaccard"] = jaccard
+        result_line.append(f"Jaccard: {jaccard:.4f}")
+
+    print(" | ".join(result_line))
+    return stats
+import heapq
+from collections import defaultdict
+
+def build_temporal_adjacency(src_list, dst_list, ts_list):
+    adj = defaultdict(list)
+    for u, v, t in zip(src_list, dst_list, ts_list):
+        adj[u].append((v, t))
+    return adj
+
+def compute_earliest_arrival(num_nodes, src_list, dst_list, ts_list):
+    adj = build_temporal_adjacency(src_list, dst_list, ts_list)
+
+    in_deg = [0] * (num_nodes + 1)
+    for v in dst_list:
+        in_deg[v] += 1
+
+    arrival_time = [float('inf')] * (num_nodes + 1)
+    heap = []
+
+    for u in range(1, num_nodes + 1):
+        heapq.heappush(heap, (0, u))
+
+    while heap:
+        curr_time, u = heapq.heappop(heap)
+        for v, t in adj.get(u, []):
+            if t >= curr_time and t < arrival_time[v]:
+                arrival_time[v] = t
+                heapq.heappush(heap, (t, v))
+
+    max_ts = max(ts_list)
+    arrival_time = [min(t, max_ts) for t in arrival_time[1:]]
+
+    return np.array(arrival_time, dtype=np.float32)
+
+
+from collections import deque
+from collections import defaultdict, deque
+def normalized_supremum_deviation(pred, label):
+    pred = (pred - np.min(pred)) / (np.max(pred) - np.min(pred))
+    label = (label - np.min(label)) / (np.max(label) - np.min(label))
+    return np.abs(np.mean(pred) - np.mean(label))
+
+
+def normalized_mae(pred, label):
+    pred = np.array(pred)
+    label = np.array(label)
+    range_label = np.max(label) - np.min(label) + 1e-8
+    return np.mean(np.abs(pred - label)) / range_label
+
+
 def edge_time_range(temporal_edges):
     """
     Args:
@@ -95,122 +269,41 @@ def pass_through_degree(temporal_edges, num_nodes):
 
     return ptd
 
+def compute_temporal_degrees(temporal_edges, num_nodes):
+    out_deg = np.zeros(num_nodes, dtype=int)
+    in_deg = np.zeros(num_nodes, dtype=int)
 
-def loss_cal(y_out, true_val, num_nodes, device):
-    _, order_y_true = torch.sort(-true_val[:num_nodes])
+    for src, dst, t in temporal_edges:
+        out_deg[src - 1] += 1
+        in_deg[dst - 1] += 1
 
-    sample_num = num_nodes * 80
-    ind_1 = torch.randint(0, num_nodes, (sample_num,)).long().to(device)
-    ind_2 = torch.randint(0, num_nodes, (sample_num,)).long().to(device)
-
-    rank_measure = torch.sign(-1 * (ind_1 - ind_2)).float()
-
-    input_arr1 = y_out[:num_nodes][order_y_true[ind_1]].to(device)
-    input_arr2 = y_out[:num_nodes][order_y_true[ind_2]].to(device)
-
-    loss_rank = torch.nn.MarginRankingLoss(margin=1.0).forward(input_arr1, input_arr2, rank_measure)
-
-    return loss_rank
-
-def compute_topk_metrics(preds, labels, k_list=[1, 10, 20, 30], jac=True):
-    """
-    Computes overlap Top@k% = |pred ∩ true| / k and full-set Jaccard index.
-    """
-    stats = {}
-    N = len(preds)
-    preds = preds.detach().cpu()
-    labels = labels.detach().cpu()
-
-    true_nonzero_set = set(torch.where(labels > 0)[0].tolist())
-
-    if len(true_nonzero_set) == 0:
-        for k in k_list:
-            stats[f"Top@{k}%"] = 0.0
-        if jac:
-            stats["Jaccard"] = 0.0
-        return stats
-
-    result_line = []
-
-    for k in k_list:
-        topk = max(1, math.ceil(N * (k / 100)))
-        pred_topk_idx = set(torch.topk(preds, topk).indices.tolist())
-        true_topk_idx = set(torch.topk(labels, topk).indices.tolist())
-
-        intersection = pred_topk_idx & true_topk_idx
-        score = len(intersection) / topk
-        stats[f"Top@{k}%"] = score
-        result_line.append(f"Top@{k}%: {score:.4f}")
-
-    if jac:
-        pred_full_set = set(torch.topk(preds, len(true_nonzero_set)).indices.tolist())
-        union = pred_full_set | true_nonzero_set
-        inter = pred_full_set & true_nonzero_set
-        jaccard = len(inter) / len(union)
-        stats["Jaccard"] = jaccard
-        result_line.append(f"Jaccard: {jaccard:.4f}")
-
-    print(" | ".join(result_line))
-    return stats
+    return out_deg, in_deg
 
 
-def generate_soft_topk_targets(true_vals, top_k=50, decay=0.95):
-    """
-    Generate soft labels: decaying weights for top-k indices based on true_vals.
-    """
-    device = true_vals.device
-    N = true_vals.size(0)
-    soft_labels = torch.zeros(N, device=device)
+def compute_temporal_out_reach(num_nodes, src_list, dst_list, ts_list, max_hops=2):
+    from collections import defaultdict, deque
 
-    topk_vals, topk_idx = torch.topk(true_vals, top_k)
-    weights = torch.tensor([decay ** i for i in range(top_k)], device=device)
-    soft_labels[topk_idx] = weights
-    return soft_labels
-
-
-import heapq
-from collections import defaultdict
-
-def build_temporal_adjacency(src_list, dst_list, ts_list):
     adj = defaultdict(list)
     for u, v, t in zip(src_list, dst_list, ts_list):
         adj[u].append((v, t))
-    return adj
 
-def compute_earliest_arrival(num_nodes, src_list, dst_list, ts_list):
-    adj = build_temporal_adjacency(src_list, dst_list, ts_list)
+    out_reach = np.zeros(num_nodes)
 
-    in_deg = [0] * (num_nodes + 1)
-    for v in dst_list:
-        in_deg[v] += 1
+    for s in range(1, num_nodes + 1):
+        visited = set()
+        queue = deque()
+        queue.append((s, -float('inf'), 0))
 
-    arrival_time = [float('inf')] * (num_nodes + 1)
-    heap = []
+        while queue:
+            u, t_curr, hops = queue.popleft()
+            if u != s:
+                visited.add(u)
+            if hops >= max_hops:
+                continue
+            for v, t_next in adj.get(u, []):
+                if t_next > t_curr:
+                    queue.append((v, t_next, hops + 1))
 
-    for u in range(1, num_nodes + 1):
-        heapq.heappush(heap, (0, u))
+        out_reach[s - 1] = len(visited)
 
-    while heap:
-        curr_time, u = heapq.heappop(heap)
-        for v, t in adj.get(u, []):
-            if t >= curr_time and t < arrival_time[v]:
-                arrival_time[v] = t
-                heapq.heappush(heap, (t, v))
-
-    max_ts = max(ts_list)
-    arrival_time = [min(t, max_ts) for t in arrival_time[1:]]
-
-    return np.array(arrival_time, dtype=np.float32)
-
-
-def normalized_supremum_deviation(pred, label):
-    pred = (pred - np.min(pred)) / (np.max(pred) - np.min(pred))
-    label = (label - np.min(label)) / (np.max(label) - np.min(label))
-    return np.abs(np.mean(pred) - np.mean(label))
-
-
-def normalized_mae(pred, label):
-    pred = np.array(pred)
-    label = np.array(label)
-    range_label = np.max(label) - np.min(label) + 1e-8
-    return np.mean(np.abs(pred - label)) / range_label
+    return out_reach
