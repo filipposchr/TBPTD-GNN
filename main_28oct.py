@@ -1011,7 +1011,7 @@ def eval_real_28oct_simpler(hint, tgan, lr_model, sampler, src, ts, label):
     for K, (hits, pct) in results.items():
         print(f"Hits@{K}: {hits}/{K} ({pct:.2f}%)")
 
-    unified_evaluation_with_statistics2(pred, true, test_pass_through_d, hint)
+    unified_evaluation_with_statistics(pred, true, test_pass_through_d, hint)
 
     e_time = (time.time() - start_time) / 60.0
     return e_time
