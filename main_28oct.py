@@ -16,9 +16,8 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import MultiStepLR
 from typing import Iterable, Tuple, Dict, List, Optional, Union 
 from scipy import stats
-from module import ConservativeSimplifiedModel_gemini_CONTR #CONTRASTIVE LEARNING FROM GEMINI
+from module import ConservativeSimplifiedModel_gemini_CONTR
 
-# Argument and global variables
 parser = argparse.ArgumentParser('Interface for Experiments')
 parser.add_argument('-d', '--data', type=str, help='data sources to use', default='edit-tgwiktioanry')
 parser.add_argument('--bs', type=int, default=1500, help='batch_size')
@@ -115,8 +114,6 @@ nodeList_train_real, train_label_l_real = load_real_train_true(
     mode_type, mode_value
 )
 
-
-
 # Load test data
 test_real_src_l, test_real_dst_l, test_real_ts_l, test_real_node_count, \
     test_real_node, test_real_time, test_real_ngh_finder, test_num_nodes, \
@@ -169,7 +166,6 @@ tgnn_model = ConservativeSimplifiedModel_gemini_CONTR(
     drop_out=DROP_OUT
 )
 
-
 class MLP(nn.Module):
     def __init__(self, input_dim=256, drop: float = 0.10):
         super().__init__()
@@ -197,13 +193,10 @@ class MLP(nn.Module):
 
 MLP_model = MLP().to(device)
 tgnn_model.to(device)
-
-
 optimizer = torch.optim.AdamW([
     {"params": tgnn_model.parameters(), "lr": LEARNING_RATE},
     {"params": MLP_model.parameters(),  "lr": LEARNING_RATE},
 ], weight_decay=1e-4)
-
 
 #Load Model
 if testing:
@@ -267,19 +260,20 @@ class LabelNormalizer:
         else:
             return y_n * self.sigma + self.mu
 
-
 # change creation to two-stage
 normalizer = LabelNormalizer(method='log1p')  # keep existing
 all_train_labels = torch.tensor(np.concatenate(train_label_l_real), dtype=torch.float32)
 normalizer.fit(all_train_labels)
+# NEW: compute z-params on top of log1p
 with torch.no_grad():
     y_log = normalizer.torch_transform(all_train_labels)
 mu = float(y_log.mean())
 sigma = float(y_log.std() + 1e-8)
 
 
-def unified_evaluation_with_statistics(pred, true, ptd_raw, dataset_name=""):
+#---------------HELPERS---------------------------------------------------------
 
+def unified_evaluation_with_statistics(pred, true, ptd_raw, dataset_name=""):
     # Convert to numpy arrays and ensure same length
     pred = np.asarray(pred, dtype=float).flatten()
     true = np.asarray(true, dtype=float).flatten()
@@ -773,7 +767,6 @@ class AdaptiveReweightedSupConLoss(nn.Module):
 
 
 def training_model_28Oct_simpler():
-
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.n_epoch, eta_min=LEARNING_RATE * 0.1
     )
@@ -812,7 +805,7 @@ def training_model_28Oct_simpler():
 
         # Trackers
         epoch_topk_1, epoch_topk_10, epoch_topk_20 = [], [], []
-        epoch_cl_loss, epoch_rank_loss, epoch_raw_huber = [], [], []
+        epoch_cl_loss, epoch_rank_loss = [], []
         epoch_total_loss = []
         epoch_z_norm = []
 
@@ -920,18 +913,18 @@ def training_model_28Oct_simpler():
 
                 epoch_cl_loss.append(float(cl_loss.detach().cpu()))
                 epoch_rank_loss.append(float(rank_loss.detach().cpu()))
-                #epoch_raw_huber.append(float(raw_huber.detach().cpu()))
                 epoch_total_loss.append(float(loss.detach().cpu()))
 
         scheduler.step()
 
-        # ---- epoch summaries
         avg_topk_1  = float(np.mean(epoch_topk_1))  if epoch_topk_1 else 0.0
         avg_topk_10 = float(np.mean(epoch_topk_10)) if epoch_topk_10 else 0.0
         avg_topk_20 = float(np.mean(epoch_topk_20)) if epoch_topk_20 else 0.0
         print(f"Epoch {epoch:02d} | Top@1%={avg_topk_1:.4f} | Top@10%={avg_topk_10:.4f} | Top@20%={avg_topk_20:.4f} | "
               f"α={alpha_cl:.4f} | CL={np.mean(epoch_cl_loss) if epoch_cl_loss else 0:.4f} | "
-              f"Rank={np.mean(epoch_rank_loss) if epoch_rank_loss else 0:.4f} | ")
+              f"Rank={np.mean(epoch_rank_loss) if epoch_rank_loss else 0:.4f} |  "
+              f"Total Loss={np.mean(epoch_total_loss) if epoch_total_loss else 0:.4f}")
+
 
 def eval_real_28oct_simpler(hint, tgan, lr_model, sampler, src, ts, label):
     start_time = time.time()
@@ -999,11 +992,9 @@ def eval_real_28oct_simpler(hint, tgan, lr_model, sampler, src, ts, label):
             pred_log = torch.clamp(pred_log, max=mu_t + MAX_Z * sd_t)
             pred_raw = normalizer.torch_inverse(pred_log).clamp_min(0)
 
-            # Collect
             all_pred_raw.append(pred_raw.detach().cpu().numpy().reshape(-1))
             all_true_raw.append(np.clip(true_batch, 0, None).reshape(-1))
 
-    # ===== whole-graph arrays =====
     pred = np.concatenate(all_pred_raw, axis=0)
     true = np.concatenate(all_true_raw, axis=0)
 
@@ -1015,7 +1006,6 @@ def eval_real_28oct_simpler(hint, tgan, lr_model, sampler, src, ts, label):
 
     e_time = (time.time() - start_time) / 60.0
     return e_time
-
 
 
 if not testing:
