@@ -8,25 +8,24 @@ import numpy as np
 import random
 from tqdm import tqdm
 import torch.nn as nn
-from module_bet import TGNN_out_comp,  TGNN_Closeness, TATKC
-from scipy.stats import weightedtau
-from nx2graphs import load_real_data, load_real_true, load_train_real_data, load_real_train_true
-from utils import loss_cal, compute_kendall_tau, compute_topk_metrics, normalized_mae, normalized_supremum_deviation, compute_topk_metrics_ptd
-from torch.optim.lr_scheduler import MultiStepLR
 import torch.nn.functional as F
+from nx2graphs import load_real_data, load_real_true, load_train_real_data, load_real_train_true
+from module import ConservativeSimplifiedModel_gemini_CONTR_30MAY
+from scipy.stats import kendalltau
+from utils import setSeeds, eval_statistics, hits_in_ks, compute_topk_metrics, LabelNormalizer, EnchRankingLoss, AdaptiveReweightedSupConLoss, AdaptiveReweightedSupConLoss_modes
+TBetGNN = ConservativeSimplifiedModel_gemini_CONTR_30MAY
 
-# Argument and global variables
 parser = argparse.ArgumentParser('Interface for Experiments')
 parser.add_argument('-d', '--data', type=str, help='data sources to use', default='edit-tgwiktioanry')
 parser.add_argument('--bs', type=int, default=1500, help='batch_size')
 parser.add_argument('--prefix', type=str, default='hello_world', help='prefix to name the checkpoints')
-parser.add_argument('--n_degree', type=int, default=5, help='number of neighbors to sample')
+parser.add_argument('--n_degree', type=int, default=25, help='number of neighbors to sample')
 parser.add_argument('--n_head', type=int, default=2, help='number of heads used in attention layer')
-parser.add_argument('--n_epoch', type=int, default=10, help='number of epochs')
+parser.add_argument('--n_epoch', type=int, default=20, help='number of epochs')
 parser.add_argument('--n_layer', type=int, default=2, help='number of network layers')
-parser.add_argument('--lr', type=float, default=0.05, help='learning rate')
-parser.add_argument('--drop_out', type=float, default=0.1, help='dropout probability')
-parser.add_argument('--gpu', type=int, default=3, help='idx for the gpu to use')
+parser.add_argument('--lr', type=float, default=0.00007,  help='learning rate')
+parser.add_argument('--drop_out', type=float, default=0.2, help='dropout probability')
+parser.add_argument('--gpu', type=int, default=0, help='sidx for the gpu to use')
 parser.add_argument('--agg_method', type=str, choices=['attn', 'lstm', 'mean'], help='local aggregation method',
                     default='attn')
 parser.add_argument('--attn_mode', type=str, choices=['prod', 'map'], default='prod',
@@ -36,8 +35,6 @@ parser.add_argument('--time', type=str, choices=['sintime', 'pos_time_aware', 't
 parser.add_argument('--uniform', action='store_true', help='take uniform sampling from temporal neighbors')
 parser.add_argument("--local_rank", type=int)
 parser.add_argument('--test', action='store_true', help='Run in test mode')
-parser.add_argument('--bet', choices=['sh', 'sfm'], help='Betweenness mode: sh (shortest), sfm (shortest-foremost)')
-parser.add_argument('--close', choices=['sh', 'f'], help='Closeness mode: sh (shortest), f (fastest)')
 
 try:
     args = parser.parse_args()
@@ -61,73 +58,35 @@ DATA = args.data
 NUM_LAYER = args.n_layer
 LEARNING_RATE = args.lr
 testing = args.test
-bet_mode = args.bet
-close_mode = args.close
-
-MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}.pth'
-LR_MODEL_SAVE_PATH = f'./saved_models/{args.agg_method}-{args.attn_mode}-{args.data}_mlp.pth'
-get_checkpoint_path = lambda \
-        epoch: f'./saved_checkpoints/{args.prefix}-{args.agg_method}-{args.attn_mode}-{args.data}-{epoch}.pth'
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
-#fh = logging.FileHandler('log/{}.log'.format(str(time.time())))
-#fh.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
 ch.setLevel(logging.WARN)
 formatter = logging.Formatter('%(asctime)s - %(message)s')
-#fh.setFormatter(formatter)
-#ch.setFormatter(formatter)
-#logger.addHandler(fh)
 logger.addHandler(ch)
 logger.info(args)
-
 
 n_feat = np.load('./data/test/Real/processed/seq/ml_{}_node.npy'.format(DATA), allow_pickle=True)
 test_real_feat = np.zeros((1400000, 128))
 
-def setSeeds(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
 setSeeds(89)
-
-if args.bet is not None:
-    mode_type = 'bet'
-    mode_value = args.bet
-elif args.close is not None:
-    mode_type = 'close'
-    mode_value = args.close
-else:
-    raise ValueError("You must specify either --bet or --close.")
 
 # Load training data
 train_real_src_l, train_real_dst_l, train_real_ts_l, train_real_node_count, \
     train_real_node, train_real_time, train_real_ngh_finder, \
-    pass_through_d_list, earl_arrival_list, \
-    out_degree_list, out_reach_list = load_train_real_data(
-        UNIFORM, mode_type, mode_value
-)
+    pass_through_d_list, ptd_indices = load_train_real_data(UNIFORM)
 
 # Load training true labels
-nodeList_train_real, train_label_l_real = load_real_train_true(
-    mode_type, mode_value
-)
+nodeList_train_real, train_label_l_real = load_real_train_true()
 
 # Load test data
 test_real_src_l, test_real_dst_l, test_real_ts_l, test_real_node_count, \
-    test_real_node, test_real_time, test_real_ngh_finder, \
-    test_pass_through_d, test_earl_arrival, \
-    test_out_degree, test_out_reach = load_real_data(
-        DATA, mode_type, mode_value
-)
+    test_real_node, test_real_time, test_real_ngh_finder, test_num_nodes, \
+    test_pass_through_d, test_pass_through_d_t, test_ptd_index, test_ptd_cache = load_real_data(DATA)
 
-if args.bet is not None:
-    nodeList_test_real, test_label_l_real = load_real_true('{}'.format(DATA), 'bet', args.bet)
-elif args.close is not None:
-    nodeList_test_real, test_label_l_real = load_real_true('{}'.format(DATA), 'close', args.close)
+nodeList_test_real, test_label_l_real = load_real_true('{}'.format(DATA))
 
 train_ts_list, test_ts_list, train_real_ts_list = [], [], []
 
@@ -135,682 +94,360 @@ for idx in range(len(nodeList_train_real)):
     train_real_ts_list.append(np.array([train_real_time[idx]] * len(nodeList_train_real[idx])))
 
 test_real_ts_list = np.array([test_real_time] * len(nodeList_test_real))
-TEST_BATCH_SIZE = BATCH_SIZE
 
 num_test_instance = len(nodeList_test_real)
-num_test_batch = math.ceil(num_test_instance / TEST_BATCH_SIZE)
+num_test_batch = math.ceil(num_test_instance / BATCH_SIZE)
 
 for k in range(num_test_batch):
-    s_idx = k * TEST_BATCH_SIZE
-    e_idx = min(num_test_instance, s_idx + TEST_BATCH_SIZE)
+    s_idx = k * BATCH_SIZE
+    e_idx = min(num_test_instance, s_idx + BATCH_SIZE)
     test_src_l_cut = np.array(nodeList_test_real[s_idx:e_idx])
     test_ts_l_cut = np.array(test_real_ts_list[s_idx:e_idx])
     test_real_ngh_finder.preprocess(tuple(test_src_l_cut), tuple(test_ts_l_cut), NUM_LAYER, NUM_NEIGHBORS)
 
-device = torch.device('cuda:{}'.format(GPU) if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+    GPU = min(GPU, torch.cuda.device_count() - 1)
+    device = torch.device(f'cuda:{GPU}')
+else:
+    device = torch.device('cpu')
+
 ngh_finder = train_real_ngh_finder[0]
 
-if args.bet is not None:
-    bet_mode = args.bet
+tb_model = TBetGNN(
+    train_real_ngh_finder[0],
+    test_real_feat,
+    attn_mode=ATTN_MODE,
+    use_time=USE_TIME,
+    agg_method=AGG_METHOD,
+    num_layers=NUM_LAYER,
+    n_head=NUM_HEADS,
+    drop_out=DROP_OUT
+)
 
-    tgnn_model = TGNN_out_comp(
-        train_real_ngh_finder[0],
-        test_real_feat,
-        attn_mode=ATTN_MODE,
-        use_time=USE_TIME,
-        agg_method=AGG_METHOD,
-        num_layers=NUM_LAYER,
-        n_head=NUM_HEADS,
-        drop_out=DROP_OUT
-    )
-elif args.close is not None:
-    close_mode = args.close
-    tgnn_model = TGNN_Closeness(
-        train_real_ngh_finder[0],
-        test_real_feat,
-        attn_mode=ATTN_MODE,
-        use_time=USE_TIME,
-        agg_method=AGG_METHOD,
-        num_layers=NUM_LAYER,
-        n_head=NUM_HEADS,
-        drop_out=DROP_OUT
-    )
-else:
-    raise ValueError("You must specify either --bet (Betweenness mode) or --close (Closeness mode).")
-
-
-class ResidualSkipGNN_Modulated_Stable(nn.Module):
-    def __init__(self, node_dim=128, drop=0.1, delta_scale=1.0):
+class MLP(nn.Module):
+    def __init__(self, input_dim=256, drop: float = 0.10):
         super().__init__()
-        self.delta_scale = delta_scale
-
-        # Predict Δ correction
-        self.correction_mlp = nn.Sequential(
-            nn.Linear(node_dim + 1, 128),
-            nn.ReLU(),
-            nn.Dropout(drop),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(drop),
-            nn.Linear(64, 1)
-        )
-
-        # Gating over correction (α ∈ [0,1], centered ~0.5)
-        self.alpha_gate = nn.Sequential(
-            nn.Linear(node_dim + 1, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-        # PTD scaling
-        self.ptd_scale = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, src_feat, ptd, return_debug=False):
-        if ptd.dim() == 1:
-            ptd = ptd.unsqueeze(-1)
-
-        # Normalize PTD
-        norm_ptd = (ptd - ptd.mean()) / (ptd.std() + 1e-6)
-        base = self.ptd_scale * norm_ptd.detach().squeeze(1)  # [B]
-
-        # Combine features
-        x = torch.cat([src_feat, norm_ptd], dim=1)  # [B, node_dim + 1]
-
-        # Predict modulation α
-        raw_alpha = self.alpha_gate(x).squeeze(1)         # unrestricted
-        alpha = 0.5 + 0.5 * torch.tanh(raw_alpha)          # ∈ (0, 1)
-
-        # Predict delta correction
-        delta = self.correction_mlp(x).squeeze(1)          # [B]
-        delta = self.delta_scale * torch.tanh(delta)       # stabilize correction
-
-        final = base + alpha * delta
-
-        if return_debug:
-            print("[DEBUG]")
-            print("  Mean α:     ", alpha.mean().item())
-            print("  Mean Δ:     ", delta.mean().item())
-            print("  Std Δ:      ", delta.std().item())
-            print("  Min/Max α:  ", alpha.min().item(), "/", alpha.max().item())
-
-            return final, alpha, delta
-        return final
-
-
-
-class MLPTwoFeaturesAct(nn.Module):
-    def __init__(self, node_dim=128, ptd_dim=128, drop=0.1):
-        super().__init__()
-
-        # Project scalar PTD to 128-dim
-        self.ptd_proj = nn.Sequential(
-            nn.Linear(1, ptd_dim),
-            nn.ReLU(),
-            nn.Dropout(drop)
-        )
-
-        # Main MLP layers
-        self.fc_1 = nn.Linear(node_dim + ptd_dim, 128)
-        self.fc_2 = nn.Linear(128, 64)
-        self.fc_3 = nn.Linear(64, 1)
-
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(drop)
-
-        # Learnable output scale for softplus
-        self.output_scale = nn.Parameter(torch.tensor(50.0))
-
-        # Weight init
-        for layer in [self.fc_1, self.fc_2, self.fc_3]:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-
-    def forward(self, src_feat, ptd):
-        if ptd.dim() == 1:
-            ptd = ptd.unsqueeze(-1)  # [B, 1]
-
-        ptd_embed = self.ptd_proj(ptd)  # [B, ptd_dim]
-
-        x = torch.cat([src_feat, ptd_embed], dim=1)  # [B, node_dim + ptd_dim]
-
-        x = self.act(self.fc_1(x))
-        x = self.dropout(x)
-        x = self.act(self.fc_2(x))
-        x = self.dropout(x)
-
-        out = self.fc_3(x).squeeze(1)  # [B]
-        return F.softplus(out) * self.output_scale
-
-
-
-
-class MLPTwoFeatures(nn.Module):
-    def __init__(self, node_dim=128, ptd_dim=128, drop=0.1):
-        super().__init__()
-
-        self.ptd_proj = nn.Sequential(
-            nn.Linear(1, 128),
-            #nn.LayerNorm(128),  # ← added here
-            nn.ReLU(),
-            nn.Dropout(drop)
-        )
-        self.fc_1 = nn.Linear(node_dim + ptd_dim, 128)
-        self.fc_2 = nn.Linear(128, 64)
-        self.fc_3 = nn.Linear(64, 1)
-
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(drop)
-
-        for layer in [self.fc_1, self.fc_2, self.fc_3]:
-            nn.init.kaiming_normal_(layer.weight)
-
-    def forward(self, src_feat, ptd):
-        # ptd: [B] or [B, 1]
-        ptd = (ptd - ptd.mean()) / (ptd.std() + 1e-6)
-
-        #print("src_feat mean:", src_feat.mean().item(), "src_feat std:", src_feat.std().item())
-        #print("ptd mean after normalization:", ptd.mean().item(), "ptd std:", ptd.std().item())
-
-        if ptd.dim() == 1:
-            ptd = ptd.unsqueeze(-1)  # [B, 1]
-
-        ptd_embed = self.ptd_proj(ptd)  # [B, ptd_dim]
-
-        x = torch.cat([src_feat, ptd_embed], dim=1)  # [B, node_dim + ptd_dim]
-
-        x = self.act(self.fc_1(x))
-        x = self.dropout(x)
-        x = self.act(self.fc_2(x))
-        x = self.dropout(x)
-        out = self.fc_3(x).squeeze(1)
-        return out
-
-class MLPTwoFeaturesSimple(nn.Module):
-    def __init__(self, node_dim=128, drop=0.1):
-        super().__init__()
-
-        # ptd is scalar → no projection needed
-        self.fc_1 = nn.Linear(node_dim + 1, 128)
-        self.fc_2 = nn.Linear(128, 64)
-        self.fc_3 = nn.Linear(64, 1)
-
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(drop)
-
-        for layer in [self.fc_1, self.fc_2, self.fc_3]:
-            nn.init.kaiming_normal_(layer.weight)
-
-    def forward(self, src_feat, ptd):
-        # ptd: [B] or [B, 1]
-        if ptd.dim() == 1:
-            ptd = ptd.unsqueeze(-1)  # [B, 1]
-
-        x = torch.cat([src_feat, ptd], dim=1)  # [B, node_dim + 1]
-
-        x = self.act(self.fc_1(x))
-        x = self.dropout(x)
-        x = self.act(self.fc_2(x))
-        x = self.dropout(x)
-        out = self.fc_3(x).squeeze(1)
-        return out
-
-class MLPThreeFeaturesHybrid(nn.Module):
-    #layer norm for ptd and arrival, no normalizaton after for arrival_feat
-    def __init__(self, node_dim=128, ptd_dim=128, drop=0.1):
-        super().__init__()
-
-        self.ptd_proj = nn.Sequential(
-            nn.Linear(1, ptd_dim),
-            nn.LayerNorm(ptd_dim),
-            nn.ReLU(),
-            nn.Dropout(drop)
-        )
-
-        self.arrival_proj = nn.Sequential(
-            nn.Linear(1, ptd_dim),
-            nn.LayerNorm(ptd_dim),
-            nn.ReLU(),
-            nn.Dropout(drop)
-        )
-
-        # Total input: src_feat + ptd + arrival = node_dim + 2 × ptd_dim
-        self.fc_1 = nn.Linear(node_dim + 2 * ptd_dim, 128)
-        self.fc_2 = nn.Linear(128, 64)
-        self.fc_3 = nn.Linear(64, 1)
-
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(drop)
-
-        for layer in [self.fc_1, self.fc_2, self.fc_3]:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-
-    def forward(self, src_feat, ptd, arrival_feat):
-        # ptd and arrival_feat: [B] or [B, 1]
-        if ptd.dim() == 1:
-            ptd = ptd.unsqueeze(-1)
-        if arrival_feat.dim() == 1:
-            arrival_feat = arrival_feat.unsqueeze(-1)
-
-        ptd_embed = self.ptd_proj(ptd)                  # [B, ptd_dim]
-
-
-        arrival_embed = self.arrival_proj(arrival_feat) # [B, ptd_dim]
-
-        x = torch.cat([src_feat, ptd_embed, arrival_embed], dim=1)  # [B, node_dim + 2 * ptd_dim]
-
-        x = self.act(self.fc_1(x))
-        x = self.dropout(x)
-        x = self.act(self.fc_2(x))
-        x = self.dropout(x)
-        out = self.fc_3(x).squeeze(1)  # [B]
-        return out
-
-class MLPTwoFeaturesHybrid(nn.Module):
-    # layer norm for ptd only, no normalization after for ptd
-    def __init__(self, node_dim=128, ptd_dim=128, drop=0.1):
-        super().__init__()
-
-        self.ptd_proj = nn.Sequential(
-            nn.Linear(1, ptd_dim),
-            nn.LayerNorm(ptd_dim),
-            nn.ReLU(),
-            nn.Dropout(drop)
-        )
-
-        # Total input: src_feat + ptd = node_dim + ptd_dim
-        self.fc_1 = nn.Linear(node_dim + ptd_dim, 128)
-        self.fc_2 = nn.Linear(128, 64)
-        self.fc_3 = nn.Linear(64, 1)
-
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(drop)
-
-        for layer in [self.fc_1, self.fc_2, self.fc_3]:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-
-    def forward(self, src_feat, ptd):
-        # ptd: [B] or [B, 1]
-        if ptd.dim() == 1:
-            ptd = ptd.unsqueeze(-1)
-
-        ptd_embed = self.ptd_proj(ptd)  # [B, ptd_dim]
-
-        x = torch.cat([src_feat, ptd_embed], dim=1)  # [B, node_dim + ptd_dim]
-
-        x = self.act(self.fc_1(x))
-        x = self.dropout(x)
-        x = self.act(self.fc_2(x))
-        x = self.dropout(x)
-        out = self.fc_3(x).squeeze(1)  # [B]
-        return out
-
-
-class MLPTwoFeaturesImproved(nn.Module):
-    def __init__(self, node_dim=128, ptd_dim=1, drop=0.1):
-        super().__init__()
-
-        # Instead of projecting PTD to 128, keep it low-dimensional (or skip projection)
-        self.ptd_proj = nn.Identity()  # optionally use nn.Linear(1, 4) if needed
-
-        # New input dim: node_dim + 1
-        self.fc_1 = nn.Linear(node_dim + ptd_dim, 128)
-        self.fc_2 = nn.Linear(128, 64)
-        self.fc_3 = nn.Linear(64, 1)
-
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(drop)
-
-        for layer in [self.fc_1, self.fc_2, self.fc_3]:
-            nn.init.kaiming_normal_(layer.weight)
-
-    def forward(self, src_feat, ptd):
-        # Normalize PTD
-        ptd = (ptd - ptd.mean()) / (ptd.std() + 1e-6)
-        if ptd.dim() == 1:
-            ptd = ptd.unsqueeze(-1)  # [B, 1]
-
-        # Optional low-rank projection (currently identity)
-        ptd_embed = self.ptd_proj(ptd)  # [B, 1]
-
-        # Concatenate
-        x = torch.cat([src_feat, ptd_embed], dim=1)  # [B, node_dim + 1]
-
-        x = self.act(self.fc_1(x))
-        x = self.dropout(x)
-        x = self.act(self.fc_2(x))
-        x = self.dropout(x)
-        out = self.fc_3(x).squeeze(1)
-        return out
-
-
-class MLP(torch.nn.Module):
-    def __init__(self, dim=128, drop=0.1):
-        super().__init__()
-        self.fc_1 = torch.nn.Linear(dim, 64)
-        self.fc_2 = torch.nn.Linear(64, 32)
-        self.fc_3 = torch.nn.Linear(32, 1)
-
-        self.act = torch.nn.ReLU()
-
-        torch.nn.init.kaiming_normal_(self.fc_1.weight)
-        torch.nn.init.kaiming_normal_(self.fc_2.weight)
-        torch.nn.init.kaiming_normal_(self.fc_3.weight)
-
-        self.dropout = torch.nn.Dropout(p=drop, inplace=False)
-
-    def forward(self, x):
-        x = self.act(self.fc_1(x))
-        x = self.dropout(x)
-        x = self.act(self.fc_2(x))
-        x = self.dropout(x)
-        return self.fc_3(x).squeeze(dim=1)
-
-
-"""
-wkt_ptd, _ = weightedtau(test_pass_through_d, test_label_l_real)
-print("PTD Kendall Tau (default) : ", wkt_ptd)
-kt_ptd, kt_nonzero_ptd = compute_kendall_tau(test_pass_through_d, test_label_l_real)
-print(f"PTD Kendall Tau (all nodes):      {kt_ptd:.4f}")
-print(f"PTD Kendall Tau (non-zero only): {kt_nonzero_ptd:.4f}")
-k_list = [1, 5, 10, 20]
-compute_topk_metrics_ptd(test_pass_through_d, test_label_l_real, k_list=k_list)
-
-"""
-
-#MLP Variants
-if mode_type == "bet" and mode_value == "sfm":
-    #MLP_model = MLPWThreeFeatures().to(device)
-    #MLP_model = MLPWThreeFeaturesSimple().to(device)
-    MLP_model = MLPTwoFeaturesHybrid().to(device)
-
-else:
-    #MLP_model = MLPTwoFeatures().to(device)
-    MLP_model = MLP().to(device)
-
-optimizer = torch.optim.Adam(list(tgnn_model.parameters()) + list(MLP_model.parameters()),lr=LEARNING_RATE)
-tgnn_model.to(device)
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, 1)
+        
+
+        self.act = nn.LeakyReLU(negative_slope=0.01)        
+        self.dropout = nn.Dropout(p=drop)
+
+        nn.init.kaiming_normal_(self.fc1.weight, nonlinearity="leaky_relu") 
+        nn.init.kaiming_normal_(self.fc2.weight, nonlinearity="leaky_relu")
+        nn.init.kaiming_normal_(self.fc3.weight, nonlinearity="leaky_relu")
+        nn.init.xavier_normal_(self.fc4.weight)
+
+    def forward(self, x: torch.Tensor):
+        x = self.dropout(self.act(self.fc1(x)))
+        x = self.dropout(self.act(self.fc2(x)))
+        x = self.dropout(self.act(self.fc3(x)))
+
+        return self.fc4(x).squeeze(-1)
+    
+MLP_model = MLP().to(device)
+tb_model.to(device)
+optimizer = torch.optim.AdamW([
+    {"params": tb_model.parameters(), "lr": LEARNING_RATE},
+    {"params": MLP_model.parameters(),  "lr": LEARNING_RATE},
+], weight_decay=1e-4)
 
 #Load Model
 if testing:
     print("Running in test mode...")
-    tgnn_model.load_state_dict(torch.load('./saved_models/model_TGAT_1.pth', weights_only=True))
-    MLP_model.load_state_dict(torch.load('./saved_models/model_MLP_1.pth', weights_only=True))
+    tb_model.load_state_dict(torch.load('./saved_models/model_TGAT_2.pth', weights_only=True))
+    MLP_model.load_state_dict(torch.load('./saved_models/model_MLP_2.pth', weights_only=True))
 
-def eval_real_data(hint, tgan, lr_model, sampler, src, ts, label):
-    start_time = time.time()
-    test_pred_list = []
-    tgan.ngh_finder = sampler
+normalizer = LabelNormalizer(method='log1p')
+all_train_labels = torch.tensor(np.concatenate(train_label_l_real), dtype=torch.float32)
+normalizer.fit(all_train_labels)
+
+with torch.no_grad():
+    y_log = normalizer.torch_transform(all_train_labels)
+mu = float(y_log.mean())
+sigma = float(y_log.std() + 1e-8)
+MAX_LOG_Y = float(y_log.max())
+
+
+all_y = torch.tensor(np.concatenate(train_label_l_real),
+                     dtype=torch.float32, device=device)
+y_log_all = normalizer.torch_transform(all_y)
+mu_t = torch.as_tensor(mu, dtype=y_log_all.dtype, device=device)
+sd_t = torch.as_tensor(sigma, dtype=y_log_all.dtype, device=device)
+z_all = (y_log_all - mu_t) / sd_t
+
+"""
+# Quantile Binning
+q = torch.quantile(z_all, torch.tensor([0.2, 0.8], device=device))
+TBC_CLASS_THRESHOLDS = q.tolist()
+edges = torch.tensor(TBC_CLASS_THRESHOLDS, device=device, dtype=torch.float32)
+"""
+
+alpha_cl = 0.3
+
+def training():
+    print("Learning Rate : ", LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.n_epoch, eta_min=LEARNING_RATE * 0.1
+    )
+    ranking_loss_fn = EnchRankingLoss(margin=1.0)
+    contrastive_loss_fn = AdaptiveReweightedSupConLoss(temperature=0.07)
+    
+    TBC_CLASS_THRESHOLDS = [-0.5, 2.0]
+
+    DEBUG_GRAD = False
+    DEBUG_GRAD_HEADS = False
+
+    def safe_loss(loss_tensor: torch.Tensor, anchor_for_graph: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(loss_tensor):
+            return (anchor_for_graph * 0.0).sum()
+        if loss_tensor.requires_grad:
+            return loss_tensor
+        return (anchor_for_graph * 0.0).sum()
+
+    
+    """
     with torch.no_grad():
-        lr_model = lr_model.eval()
-        tgan = tgan.eval()
-        TEST_BATCH_SIZE = BATCH_SIZE
-        num_test_instance = len(src)
-        num_test_batch = math.ceil(num_test_instance / TEST_BATCH_SIZE)
+        all_y = torch.tensor(np.concatenate(train_label_l_real), dtype=torch.float32, device=device)
+        y_log_all = normalizer.torch_transform(all_y)
+        z_all = (y_log_all - mu) / sigma
+        
+        z_non_zero = z_all[all_y > 0]
+        
+        q_probs = torch.tensor([0.75, 0.92], device=device) 
+        TBC_CLASS_THRESHOLDS = torch.quantile(z_non_zero, q_probs).tolist()
+        print(f"Applying Quantile Binning: Thresholds set to {TBC_CLASS_THRESHOLDS}")
 
-        wkt_ptd, _ = weightedtau(test_pass_through_d, label)
-        print("PTD Kendall Tau (default) : ", wkt_ptd)
-        kt_ptd, kt_nonzero_ptd = compute_kendall_tau(test_pass_through_d, label)
-        print(f"PTD Kendall Tau (all nodes):      {kt_ptd:.4f}")
-        print(f"PTD Kendall Tau (non-zero only): {kt_nonzero_ptd:.4f}")
-        k_list = [1, 5, 10, 20]
-        compute_topk_metrics_ptd(test_pass_through_d, label, k_list=k_list)
+    TBC_CLASS_THRESHOLDS = [mu - sigma, mu + sigma]
+    print("Adaptive Thresholding (Variance-based)")
+    """
 
-        #all_alpha = []
-        for k in tqdm(range(num_test_batch), desc="Evaluating batches"):
-            s_idx = k * TEST_BATCH_SIZE
-            e_idx = min(num_test_instance, s_idx + TEST_BATCH_SIZE)
-            test_src_l_cut = np.array(src[s_idx:e_idx])
-            test_ts_l_cut = np.array(ts[s_idx:e_idx])
-            src_embed = tgan.tem_conv(
-                src_idx_l=test_src_l_cut,
-                cut_time_l=test_ts_l_cut,
-                curr_layers=NUM_LAYER,
-                num_neighbors=NUM_NEIGHBORS
-            )
-
-            if mode_type == "bet":
-                if test_pass_through_d is None:
-                    raise ValueError("test_pass_through_d not loaded for betweenness mode.")
-
-                ptd = test_pass_through_d[test_src_l_cut - 1].float()
-                test_pass_through_degree_batch = ptd.unsqueeze(-1)
-
-                if mode_value == "sh":
-                    # Shortest Betweenness
-                    #test_pred = lr_model(src_embed, test_pass_through_degree_batch)
-                    test_pred = lr_model(src_embed)
-
-                    #test_pred, alpha, _ = lr_model(src_embed, test_pass_through_degree_batch, return_debug=True)
-                    #all_alpha.append(alpha.cpu())
-                elif mode_value == "sfm":
-                    # Shortest-Foremost Betweenness
-                    if test_earl_arrival is None:
-                        raise ValueError("test_earl_arrival not loaded for sfm mode.")
-
-                    earl_arr = test_earl_arrival[test_src_l_cut - 1].float()
-                    test_earl_arrival_batch = earl_arr.unsqueeze(-1)
-
-                    #test_pred = lr_model(src_embed, test_pass_through_degree_batch, test_earl_arrival_batch)
-                    test_pred = lr_model(src_embed, test_pass_through_degree_batch)
-
-            elif mode_type == "close":
-                if mode_value == "f":
-                    if test_out_degree is None:
-                        raise ValueError("test_out_degree not loaded for closeness-fastest mode.")
-
-                    out_d = test_out_degree[test_src_l_cut - 1].float()
-                    test_out_degree_batch = out_d.unsqueeze(-1)
-
-                    test_pred = lr_model(src_embed, test_out_degree_batch)
-
-                elif mode_value == "sh":
-                    if test_out_reach is None:
-                        raise ValueError("test_out_reach not loaded for closeness-shortest mode.")
-
-                    out_r = test_out_reach[test_src_l_cut - 1].float()
-                    test_out_reach_batch = out_r.unsqueeze(-1)
-
-                    test_pred = lr_model(src_embed, test_out_reach_batch)
-
-                else:
-                    raise ValueError(f"Unknown closeness mode: {mode_value}")
-
-
-
-            test_pred_list.extend(test_pred.cpu().detach().numpy().tolist())
-
-        with open("test_kendaltau/predicted_values_mathoverflow_sparse.txt", "w") as pred_file:
-            for value in test_pred_list:
-                pred_file.write(f"{value}\n")
-
-
-        label = np.clip(label, a_min=0.0, a_max=None)
-        wkt, _ = weightedtau(test_pred_list, label)
-
-
-        #Additional Metrics
-        sd_value = normalized_supremum_deviation(test_pred_list, label)
-        norm_mae = normalized_mae(test_pred_list, label)
-
-        num_nodes = len(label)
-        norm_factor = 1 / (num_nodes * (num_nodes - 1))
-        norm_label = norm_factor * label
-
-        pred = np.array(test_pred_list)
-        true = np.array(label)
-        mask = (pred <= 0) & (true > 0)
-        count = np.sum(mask)
-        print("Number of nodes with pred ≤ 0 and true > 0:", count)
-        print("Supremum Deviation Norm:", sd_value)
-        print("MAE Norm:", norm_mae)
-
-        print("Kendall Tau (default) : ", wkt)
-        kt_all, kt_nonzero = compute_kendall_tau(test_pred_list, label)
-        print(f"Kendall Tau (all nodes):      {kt_all:.4f}")
-        print(f"Kendall Tau (non-zero only): {kt_nonzero:.4f}")
-
-        if not torch.is_tensor(test_pred_list):
-            test_pred_list = torch.tensor(test_pred_list, dtype=torch.float32)
-        if not torch.is_tensor(label):
-            label = torch.tensor(label, dtype=torch.float32)
-
-        k_list = [1, 5, 10, 20]
-        compute_topk_metrics(test_pred_list, label, k_list=k_list)
-
-        # --- Print α statistics ---
-        '''
-        if len(all_alpha) > 0:
-            all_alpha_tensor = torch.cat(all_alpha)
-            print(f"\n[α Modulation Diagnostics]")
-            print(f"  Mean α:           {all_alpha_tensor.mean():.4f}")
-            print(f"  Median α:         {all_alpha_tensor.median():.4f}")
-            print(f"  Std α:            {all_alpha_tensor.std():.4f}")
-            print(f"  Min α:            {all_alpha_tensor.min():.4f}")
-            print(f"  Max α:            {all_alpha_tensor.max():.4f}")
-            print(f"  Fraction α > 0.8: {(all_alpha_tensor > 0.8).float().mean():.2%}")
-            print(f"  Fraction α < 0.2: {(all_alpha_tensor < 0.2).float().mean():.2%}")
-        '''
-    end_time = time.time()
-    e_time = (end_time - start_time) / 60.0
-
-    return  e_time
-
-def training_model():
     for epoch in range(NUM_EPOCH):
-        epoch_topk_10 = []
-        epoch_topk_20 = []
-        epoch_topk_1 = []
 
-        tgnn_model.train()
+        epoch_topk_1, epoch_topk_10, epoch_topk_20 = [], [], []
+        epoch_cl_loss, epoch_rank_loss = [], []
+        epoch_total_loss = []
+
+        g_epoch = dict(
+            mlp_gnorm=[],
+            mlp_relupd=[],
+            mlp_gabsmax=[],
+            mlp_zero_frac=[],
+            tgnn_gnorm=[],
+            tgnn_relupd=[],
+            tgnn_gabsmax=[],
+            tgnn_zero_frac=[],
+        )
+        if DEBUG_GRAD_HEADS:
+            g_epoch_buckets = {}
+
+        tb_model.train()
         MLP_model.train()
-        m_loss = []
 
         graph_indices = list(range(len(train_real_ts_l)))
+        for j in graph_indices:
+            tb_model.ngh_finder = train_real_ngh_finder[j]
 
-        for j in tqdm(graph_indices):
-            tgnn_model.ngh_finder = train_real_ngh_finder[j]
-
-            node_list = nodeList_train_real[j]
+            node_list  = nodeList_train_real[j]
             label_list = train_label_l_real[j]
-            ts_list = train_real_ts_list[j]
+            ts_list    = train_real_ts_list[j]
 
-            num_train_instance = len(node_list)
-            num_train_batch = math.ceil(num_train_instance / BATCH_SIZE)
-            if mode_type == "bet":
-                pass_through_degree = pass_through_d_list[j]
-                if mode_value == "sfm":
-                    earl_arrival = earl_arrival_list[j]
-            elif mode_type == "close":
-                if mode_value == "f":
-                    out_degree = out_degree_list[j]
-                elif mode_value == "sh":
-                    out_reach = out_reach_list[j]
-
+            num_train_batch = math.ceil(len(node_list) / BATCH_SIZE)
             for batch_i in range(num_train_batch):
+                optimizer.zero_grad(set_to_none=True)
+
                 s_idx = batch_i * BATCH_SIZE
-                e_idx = min(num_train_instance, s_idx + BATCH_SIZE)
+                e_idx = min(len(node_list), s_idx + BATCH_SIZE)
+                if e_idx - s_idx < 1:
+                    continue
 
                 src_l_cut = np.array(node_list[s_idx:e_idx])
-                ts_l_cut = ts_list[s_idx:e_idx]
+                ts_l_cut  = ts_list[s_idx:e_idx]
                 label_l_cut = label_list[s_idx:e_idx]
+                t_cut = ts_l_cut[0]
 
-                optimizer.zero_grad()
-                scheduler = MultiStepLR(optimizer, milestones=[10], gamma=0.01)
+                ptd_past_1b, _, _ = ptd_indices[j].snapshot_partition_all(t_cut)
+                tb_model.set_ptd_vector(ptd_past_1b)
 
-                src_embed = tgnn_model.tem_conv(
+                src_embed = tb_model.tem_conv2(
                     src_idx_l=src_l_cut,
                     cut_time_l=ts_l_cut,
+                    ptd_l=None,
                     curr_layers=NUM_LAYER,
                     num_neighbors=NUM_NEIGHBORS
                 )
-                true_label = torch.tensor(label_l_cut, dtype=torch.float32).to(device)
+                
+                true_raw = torch.tensor(label_l_cut, dtype=torch.float32, device=device)
+                y_log = normalizer.torch_transform(true_raw)
+                mu_t = torch.as_tensor(mu,    dtype=y_log.dtype, device=device)
+                sd_t = torch.as_tensor(sigma, dtype=y_log.dtype, device=device)
+                true_z = (y_log - mu_t) / sd_t
 
-                if mode_type == "bet":
-                    ptd = pass_through_degree[src_l_cut - 1].float()
-                    pass_through_degree_batch = ptd.unsqueeze(-1)
-                    if mode_value == "sh":
-                        #pred_value = MLP_model(src_embed, pass_through_degree_batch)
-                        pred_value = MLP_model(src_embed)
+                """
+                # ---- CL classes (in z-space)
+                tbc_classes = torch.zeros_like(true_z, dtype=torch.long, device=device)
+                med_mask  = (true_z >= TBC_CLASS_THRESHOLDS[0]) & (true_z < TBC_CLASS_THRESHOLDS[1])
+                high_mask = (true_z >= TBC_CLASS_THRESHOLDS[1])
+                tbc_classes[med_mask]  = 1
+                tbc_classes[high_mask] = 2
+                """  
+                
+                edges = torch.tensor(TBC_CLASS_THRESHOLDS, device=device, dtype=true_z.dtype)
+                tbc_classes = torch.bucketize(true_z, edges)
+                
+                idx = torch.as_tensor(src_l_cut, device=device).long().clamp(min=1) - 1
+                ptd_pair = tb_model.ptd_vec[idx]
+                ptd_enc  = tb_model.ptd_mlp(ptd_pair)
+                
+                mlp_in = torch.cat([src_embed, ptd_enc], dim=1)
+                pred_log = MLP_model(mlp_in).squeeze(-1) 
+                pred_raw = normalizer.torch_inverse(pred_log).clamp_min(0)
+                
+                z = tb_model.contrast_head(src_embed)
+                cl_loss = contrastive_loss_fn(z, tbc_classes, true_z)
+                cl_loss = safe_loss(cl_loss, pred_log)
 
-                        #pred_value, alpha, _ = MLP_model(src_embed, pass_through_degree_batch, return_debug=True)
-                    elif mode_value == "sfm":
-                        earl_arr = earl_arrival[src_l_cut - 1].float()
-                        earl_arr_batch = earl_arr.unsqueeze(-1)
-                        #pred_value = MLP_model(src_embed, pass_through_degree_batch, earl_arr_batch)
+                rank_loss = ranking_loss_fn(pred_log, y_log)
+                rank_loss = safe_loss(rank_loss, pred_log) 
+                
+                loss = alpha_cl * cl_loss + (1.0 - alpha_cl) * rank_loss
 
-                        pred_value = MLP_model(src_embed, pass_through_degree_batch)
-
-                elif mode_type == "close":
-                    if mode_value == "f":
-                        out_d = out_degree[src_l_cut - 1].float()
-                        out_degree_batch = out_d.unsqueeze(-1)
-                        pred_value = MLP_model(src_embed, out_degree_batch)
-                    elif mode_value == "sh":
-                        out_r = out_reach[src_l_cut - 1].float()
-                        out_reach_batch = out_r.unsqueeze(-1)
-                        pred_value = MLP_model(src_embed, out_reach_batch)
-
-                topk_stats = compute_topk_metrics(pred_value, true_label, k_list=[1 ,5, 10, 20, 30], jac=False)
-
-                if topk_stats['Top@1%'] == 0.0 and topk_stats['Top@20%'] == 0.0 and topk_stats['Top@30%'] == 0.0:
+                if torch.isnan(loss).any():
                     continue
 
-                loss = loss_cal(pred_value, true_label, len(pred_value), device)
-
-
-                epoch_topk_1.append(topk_stats['Top@1%'])
-                epoch_topk_10.append(topk_stats['Top@10%'])
-                epoch_topk_20.append(topk_stats['Top@20%'])
-
-                #loss += 0.1 * ((1 - alpha) ** 2).mean()
-
                 loss.backward()
-
-                #for name, param in MLP_model.named_parameters():
-                #    if param.grad is not None:
-                #        print(name, param.grad.norm().item())
-
-                torch.nn.utils.clip_grad_norm_(list(tgnn_model.parameters()) + list(MLP_model.parameters()), max_norm=1.0)
+                
+                pre_clip = torch.nn.utils.clip_grad_norm_(
+                    list(tb_model.parameters()) + list(MLP_model.parameters()),
+                    max_norm=1.0
+                )
                 optimizer.step()
-                scheduler.step()
-                m_loss.append(loss.item())
 
-        avg_topk_1 = np.mean(epoch_topk_1)
-        avg_topk_10 = np.mean(epoch_topk_10)
-        avg_topk_20 = np.mean(epoch_topk_20)
+                with torch.no_grad():
+                    topk_stats = compute_topk_metrics(
+                        pred_raw, true_raw, k_list=[1, 5, 10, 20, 30], jac=False
+                    )
+                if not (topk_stats['Top@1%'] == 0.0 or topk_stats['Top@20%'] == 0.0 or topk_stats['Top@30%'] == 0.0):
+                    epoch_topk_1.append(topk_stats['Top@1%'])
+                    epoch_topk_10.append(topk_stats['Top@10%'])
+                    epoch_topk_20.append(topk_stats['Top@20%'])
 
-        print(
-            f" Epoch {epoch:02d} Summary : Avg Top@1%: {avg_topk_1:.4f} | Top@10%: {avg_topk_10:.4f} | Top@20%: {avg_topk_20:.4f} ")
+                epoch_cl_loss.append(float(cl_loss.detach().cpu()))
+                epoch_rank_loss.append(float(rank_loss.detach().cpu()))
+                epoch_total_loss.append(float(loss.detach().cpu()))
 
-        epoch_loss = np.mean(m_loss)
-        logger.info(f"Epoch {epoch}: Avg Loss {epoch_loss:.5f}")
+        scheduler.step()
 
+        avg_topk_1  = float(np.mean(epoch_topk_1))  if epoch_topk_1 else 0.0
+        avg_topk_10 = float(np.mean(epoch_topk_10)) if epoch_topk_10 else 0.0
+        avg_topk_20 = float(np.mean(epoch_topk_20)) if epoch_topk_20 else 0.0
+        print(f"Epoch {epoch:02d} | Top@1%={avg_topk_1:.4f} | Top@10%={avg_topk_10:.4f} | Top@20%={avg_topk_20:.4f} | "
+              f"α={alpha_cl:.4f} | CL={np.mean(epoch_cl_loss) if epoch_cl_loss else 0:.4f} | "
+              f"Rank={np.mean(epoch_rank_loss) if epoch_rank_loss else 0:.4f} |  "
+              f"Total Loss={np.mean(epoch_total_loss) if epoch_total_loss else 0:.4f}")
+
+        if DEBUG_GRAD and (g_epoch["mlp_gnorm"] or g_epoch["tgnn_gnorm"]):
+            def _m(x): 
+                return float(np.median(x)) if len(x) else float("nan")
+            print(
+                f"[GRAD][Ep {epoch:02d}] "
+                f"MLP: gnorm~{_m(g_epoch['mlp_gnorm']):.2e}, rel~{_m(g_epoch['mlp_relupd']):.2e}, "
+                f"gmax~{_m(g_epoch['mlp_gabsmax']):.2e}, zero~{_m(g_epoch['mlp_zero_frac']):.1%} | "
+                f"TGNN: gnorm~{_m(g_epoch['tgnn_gnorm']):.2e}, rel~{_m(g_epoch['tgnn_relupd']):.2e}, "
+                f"gmax~{_m(g_epoch['tgnn_gabsmax']):.2e}, zero~{_m(g_epoch['tgnn_zero_frac']):.1%}"
+            )
+            if DEBUG_GRAD_HEADS and 'g_epoch_buckets' in locals():
+                def _pull(bk, key):
+                    arr = [d[key] for d in g_epoch_buckets.get(bk, [])]
+                    return _m(arr)
+                line = " | ".join([
+                    f"{bk}: g~{_pull(bk,'gnorm'):.2e}, rel~{_pull(bk,'rel'):.2e}, "
+                    f"z~{_pull(bk,'zf'):.1%}, gmax~{_pull(bk,'gmax'):.1e}"
+                    for bk in ["contrast_head","ptd_mlp","temporal_conv","other"]
+                ])
+                print(f"    [GRAD][Ep {epoch:02d}] TGNN buckets | {line}")
+
+def evaluation(hint, tgan, mlp_model, sampler, src, ts, label):
+    start_time = time.time()
+    tgan.ngh_finder = sampler
+
+    lr_model = mlp_model.eval()
+    tgan = tgan.eval()
+
+    all_pred_raw, all_true_raw = [], []
+
+    num_test_instance = len(src)
+    num_test_batch = math.ceil(num_test_instance / BATCH_SIZE)
+
+    with torch.no_grad():
+        for k in range(num_test_batch):
+            s_idx = k * BATCH_SIZE
+            e_idx = min(num_test_instance, s_idx + BATCH_SIZE)
+            if e_idx - s_idx < 1:
+                continue
+
+            test_src_l_cut = np.array(src[s_idx:e_idx])
+            test_ts_l_cut  = np.array(ts[s_idx:e_idx])
+
+            t_cut = float(test_ts_l_cut[0])
+            ptd_past_1b = test_ptd_cache.get(t_cut)
+            if ptd_past_1b is None:
+                ptd_past_1b, _, _ = test_ptd_index.snapshot_partition_all(t_cut)d
+                test_ptd_cache[t_cut] = ptd_past_1b
+            tgan.set_ptd_vector(ptd_past_1b)
+            
+            test_src = np.array(src[s_idx:e_idx], dtype=np.int64)
+            idx0 = np.clip(test_src, 1, test_num_nodes) - 1
+            idx_t = torch.as_tensor(idx0, device=device).long()
+
+            true_batch = np.asarray(label, dtype=float)[idx0]
+            true_raw = torch.as_tensor(true_batch, dtype=torch.float32, device=device)
+            y_log_true = normalizer.torch_transform(true_raw)
+            
+            src_embed = tgan.tem_conv2(
+                src_idx_l=test_src_l_cut,
+                cut_time_l=test_ts_l_cut,
+                ptd_l=None,
+                curr_layers=NUM_LAYER,
+                num_neighbors=NUM_NEIGHBORS
+            )
+            
+
+            idx = torch.as_tensor(test_src_l_cut, device=src_embed.device).long().clamp(min=1) - 1
+            ptd_pair = tgan.ptd_vec[idx]
+            ptd_enc  = tgan.ptd_mlp(ptd_pair)
+            mlp_in = torch.cat([src_embed, ptd_enc], dim=1)
+            
+            pred_log = mlp_model(mlp_in).squeeze(-1)
+            pred_raw = normalizer.torch_inverse(pred_log).clamp_min(0)
+
+            all_pred_raw.append(pred_raw.detach().cpu().numpy().reshape(-1))
+            all_true_raw.append(np.clip(true_batch, 0, None).reshape(-1))
+
+    pred = np.concatenate(all_pred_raw, axis=0)
+    true = np.concatenate(all_true_raw, axis=0)
+
+    results = hits_in_ks(true, pred, Ks=[10, 30, 50])
+
+    for K, (hits, pct) in results.items():
+        print(f"Hits@{K}: {hits}/{K} ({pct:.2f}%)")
+
+    for K, (hits, pct) in results.items():
+        print(f"Hits RAW PTD@{K}: {hits}/{K} ({pct:.2f}%)")
+
+    eval_statistics(pred, true, test_pass_through_d, hint)
+
+    e_time = (time.time() - start_time)
+    print("Evaluation time for {}: {:.2f} seconds".format(hint, e_time))
+    return e_time
 
 
 if not testing:
-    training_model()
+    training()
+    torch.save(MLP_model.state_dict(), './saved_models/model_MLP_2.pth')
+    torch.save(tb_model.state_dict(), './saved_models/model_TGAT_2.pth')
 
-#Save Model
-if not testing:
-    print("Running in training mode...")
-    torch.save(MLP_model.state_dict(), './saved_models/model_MLP_3.pth')
-    torch.save(tgnn_model.state_dict(), './saved_models/model_TGAT_3.pth')
-
-
-e_time = eval_real_data('test for real data', tgnn_model, MLP_model, test_real_ngh_finder,
-                                              nodeList_test_real, test_real_ts_list, test_label_l_real)
-
-
-'''
-1) mlp_1: TGNN_out_comp  - sh - MLP -  neighbors = 5, epochs = 10, layers = 2
-2) mlp_2: TGNN_out_comp - sh - MLP  - epochs = 10, layers = 3 - sparse
-3) mlp_3: TGNN_out_comp - sh - MLP  - epochs = 10, layers = 2 - sparse
-
-Bet:
-    SFM: MLPTwoFeaturesHybrid > MLPThreeFeaturesHybrid
-         TGNN_out_comp - sfm - MLPWThreeFeatures   - neighbors = 5, epochs = 10 - BAD
-Closeness:
-
-'''
+e_time = evaluation('test for real data', tb_model, MLP_model, test_real_ngh_finder, nodeList_test_real, test_real_ts_list, test_label_l_real)
