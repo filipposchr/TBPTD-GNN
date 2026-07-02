@@ -1,15 +1,16 @@
 import pandas as pd
 import numpy as np
-import networkx as nx
 import pickle
 import os
 import torch
 from graph import NeighborFinder
-from utils import temporal_adjacency_list, pass_through_degree, compute_earliest_arrival, compute_temporal_out_reach, compute_temporal_degrees
+from utils import pass_through_degree
+from typing import Iterable, Tuple, List
 
-def load_real_data(dataName, mode_type, mode_value):
+def load_real_data(dataName):
     g_df = pd.read_csv('./data/test/Real/processed/seq/ml_{}.csv'.format(dataName))
     print(f"Testing dataset: {dataName}")
+
     src, dst, ts = g_df['u'].values, g_df['i'].values, g_df['ts'].values
 
     num_nodes = len(set(np.unique(np.hstack([src, dst]))))
@@ -34,49 +35,68 @@ def load_real_data(dataName, mode_type, mode_value):
     for ngh_list in adj_list_out:
         ngh_list.sort(key=lambda x: x[2])
 
-    ngh_finder = NeighborFinder(adj_list, adj_list_out, uniform=False)
+    ngh_finder = NeighborFinder(adj_list, uniform=False)
 
     temporal_edges = list(zip(src_list, dst_list, ts_list))
 
     pass_through_d = None
-    earl_arrival   = None
-    out_degree     = None
-    out_reach      = None
 
-    if mode_type == 'bet':
-        pass_through_d = pass_through_degree(temporal_edges, num_nodes)
-        pass_through_d = torch.tensor(pass_through_d, dtype=torch.float32)
+    temporal_edges_1b = list(zip(src_list.tolist(), dst_list.tolist(), ts_list.tolist()))
+    ptd_index  = PTDIndex(temporal_edges_1b, max_idx)
+    ptd_cache  = {}
 
-        if mode_value == 'sfm':
-            earl_arrival = compute_earliest_arrival(num_nodes, src_list, dst_list, ts_list)
-            earl_arrival = torch.tensor(earl_arrival, dtype=torch.float32)
+    ptd_total_1b = ptd_index.total
+    pass_through_d_t = torch.tensor(ptd_total_1b[1:], dtype=torch.float32)
 
-    elif mode_type == 'close':
-        if mode_value == 'f':
-            out_degree, _ = compute_temporal_degrees(temporal_edges, num_nodes)
-            out_degree = torch.tensor(out_degree, dtype=torch.float32)
-        elif mode_value == 'sh':
-            out_reach = compute_temporal_out_reach(num_nodes, src_list, dst_list, ts_list)
-            out_reach = torch.tensor(out_reach, dtype=torch.float32)
-        else:
-            raise ValueError(f"Unknown closeness mode: {mode_value}")
+    pass_through_d = pass_through_degree(temporal_edges, num_nodes)
+    pass_through_d = torch.tensor(pass_through_d, dtype=torch.float32)
+
+    return src_list, dst_list, ts_list, node_count, node_list, maxTime_list, ngh_finder, num_nodes, pass_through_d, pass_through_d_t, ptd_index, ptd_cache
+
+class PTDIndex:
+    def __init__(self, temporal_edges_1b: Iterable[Tuple[int,int,float]], num_nodes_1b: int):
+        self.N = int(num_nodes_1b)
+        T_in:  List[List[float]] = [[] for _ in range(self.N + 1)]
+        T_out: List[List[float]] = [[] for _ in range(self.N + 1)]
+        for s, d, ts in temporal_edges_1b:
+            if 1 <= d <= self.N: T_in[d].append(ts)
+            if 1 <= s <= self.N: T_out[s].append(ts)
+
+        self.T_out  = [np.asarray(sorted(T_out[u]), dtype=np.float64)  for u in range(self.N + 1)]
+        self.prefix = [np.empty(0, dtype=np.int64) for _ in range(self.N + 1)]
+        self.total  = np.zeros(self.N + 1, dtype=np.int64)
+
+        for u in range(1, self.N + 1):
+            tin  = np.asarray(sorted(T_in[u]), dtype=np.float64)
+            tout = self.T_out[u]
+            if tout.size == 0:
+                continue
+            counts = np.searchsorted(tin, tout, side="left").astype(np.int64)
+            pref = counts.cumsum()
+            self.prefix[u] = pref
+            self.total[u]  = int(pref[-1])
+
+    def snapshot_partition_all(self, t: float):
+        past  = np.zeros(self.N + 1, dtype=np.int64)
+        fut   = np.zeros(self.N + 1, dtype=np.int64)
+        total = self.total.copy()
+        for u in range(1, self.N + 1):
+            tout = self.T_out[u]
+            if tout.size == 0:
+                continue
+            split = np.searchsorted(tout, t, side="left")
+            pref  = self.prefix[u]
+            p     = int(pref[split-1]) if split > 0 else 0
+            past[u] = p
+            fut[u]  = int(total[u] - p)
+        return past, fut, total
 
 
-    return src_list, dst_list, ts_list, node_count, node_list, maxTime_list, ngh_finder, pass_through_d, earl_arrival, out_degree, out_reach
-
-def load_train_real_data(UNIFORM,  mode_type, mode_value, save_dir="graph_features"):
+def load_train_real_data(UNIFORM, save_dir="graph_features"):
     src_list, dst_list, ts_list, node_count, node_list, maxTime_list, ngh_finder = [], [], [], [], [], [], []
 
     pass_through_d_list = []
-    earl_arrival_list = []
-    out_degree_list = []
-    out_reach_list = []
-
     pass_through_d = None
-    earl_arrival = None
-    out_degree = None
-    out_reach = None
-
 
     train_real_datasets = ['edit-mrwiktionary', 'edit-siwiktionary', 'edit-stwiktionary', 'edit-wowiktionary',
                            'edit-tkwiktionary', 'edit-aywiktionary', 'edit-anwiktionary', 'edit-pawiktionary',
@@ -90,51 +110,34 @@ def load_train_real_data(UNIFORM,  mode_type, mode_value, save_dir="graph_featur
                            'edit-rwwiktionary', 'edit-stwikipedia', 'edit-olowikipedia', 'edit-tnwikipedia',
                            'edit-ffwikipedia', 'edit-dzwikipedia', 'edit-tyvwikipedia',
                            'edit-xhwikipedia',  'edit-tswikipedia', 'edit-bgwikiquote',
-                           'edit-idwikiquote', 'edit-aswikiquote', 'edit-yiwikiquote', 'edit-sawikiquote']
+                            'edit-idwikiquote', 'edit-aswikiquote', 'edit-yiwikiquote', 'edit-sawikiquote']
+   
+    save_all_graph_features(train_real_datasets, save_dir="graph_features")
 
-    train_real_datasets = [f"temporal_ER_graph_{i}_seq" for i in range(44)]
-
-    print("Total training graphs : ", len(train_real_datasets))
-
-
-    save_all_graph_features(train_real_datasets,mode_type, mode_value, save_dir="graph_features")
+    ptd_indices = []
 
     for dataset_name in train_real_datasets:
-        # Load the dataset
-        #g_df = pd.read_csv(f'./data/train/Real/processed/seq/ml_{dataset_name}.csv')
-        g_df = pd.read_csv(f'./data/train/Real/processed/ER_15k/ml_edit-{dataset_name}.csv')
-
+        g_df = pd.read_csv(f'./data/train/Real/processed/seq/ml_{dataset_name}.csv')
         src_list.append(g_df.u.values)
         dst_list.append(g_df.i.values)
         ts_list.append(g_df.ts.values)
         max_idx = max(g_df.u.values.max(), g_df.i.values.max())
 
-        # Load precomputed features from pickle
         file_path = os.path.join(save_dir, f"{dataset_name}_features.pkl")
         if os.path.exists(file_path):
             with open(file_path, "rb") as f:
                 graph_features = pickle.load(f)
 
-        if mode_type == "bet":
-            pass_through_d = graph_features.get("pass_through_d")
-            pass_through_d_list.append(pass_through_d)
-            if mode_value == "sfm":
-                earl_arrival = graph_features.get("earl_arrival")
-                earl_arrival_list.append(earl_arrival)
-        elif mode_type == "close":
-            if mode_value == "f":
-                out_degree = graph_features.get("out_degree")
-                out_degree_list.append(out_degree)
-            elif mode_value == "sh":
-                out_reach = graph_features.get("out_reach")
-                out_reach_list.append(out_reach)
-            else:
-                raise ValueError(f"Unknown closeness mode: {mode_value}")
-        else:
-            raise ValueError(f"Unknown mode type: {mode_type}")
 
+        num_nodes_j = int(max(g_df.u.max(), g_df.i.max()))
+        temporal_edges_1b = list(zip(g_df.u.values.astype(int),
+                                    g_df.i.values.astype(int),
+                                    g_df.ts.values.astype(float)))
+        ptd_indices.append(PTDIndex(temporal_edges_1b, num_nodes_j))
 
-        # Populate adjacency list for NeighborFinder
+        pass_through_d = graph_features.get("pass_through_d")
+        pass_through_d_list.append(pass_through_d)
+
         adj_list = [[] for _ in range(max_idx + 1)]
         for src, dst, eidx, ts in zip(src_list[-1], dst_list[-1], g_df.idx.values, ts_list[-1]):
             adj_list[dst].append((src, eidx, ts))
@@ -143,43 +146,18 @@ def load_train_real_data(UNIFORM,  mode_type, mode_value, save_dir="graph_featur
         for src, dst, eidx, ts in zip(src_list[-1], dst_list[-1], g_df.idx.values, ts_list[-1]):
             adj_list_out[src].append((dst, eidx, ts))
 
-        # Add graph-specific details
         node_count.append(len(set(np.unique(np.hstack([g_df.u.values, g_df.i.values])))))
 
         node_list.append(np.unique(np.hstack([src_list[-1], dst_list[-1]])))
         maxTime_list.append(max(g_df.ts.values))
-        ngh_finder.append(NeighborFinder(adj_list, adj_list_out, uniform=UNIFORM))
+        #ngh_finder.append(NeighborFinder(adj_list, adj_list_out, uniform=UNIFORM))
+        ngh_finder.append(NeighborFinder(adj_list, uniform=UNIFORM))
 
-    return (src_list, dst_list, ts_list, node_count, node_list, maxTime_list, ngh_finder, pass_through_d_list, earl_arrival_list, out_degree_list, out_reach_list)
-
-
-def load_real_true(dataName, mode_type, mode_value):
-    """
-    mode_type: either 'bet' or 'close'
-    mode_value: the mode string, e.g. 'sh', 'sfm', 'f'
-    """
-    if mode_type == 'bet':
-        if mode_value == 'sh':
-            print("  Temporal Shortest Betweenness...")
-            path = f'./data/test/Real/scores/graph_{dataName}_bet.txt'
-        elif mode_value == 'sfm':
-            print("  Temporal Shortest-Foremost Betweenness...")
-            path = f'./data/test/Real/shf-bc_scores/graph_{dataName}_shf_bet.txt'
-        else:
-            raise ValueError(f"Unknown betweenness mode: {mode_value}")
-    elif mode_type == 'close':
-        if mode_value == 'f':
-            print("  Temporal Fastest Closeness...")
-            path = f'./data/test/Real/f-cl_scores/graph_{dataName}_cf.txt'
-        elif mode_value == 'sh':
-            print("  Temporal Shortest Closeness...")
-            path = f'./data/test/Real/sh-cl_scores/graph_{dataName}_shc.txt'
-        else:
-            raise ValueError(f"Unknown closeness mode: {mode_value}")
-    else:
-        raise ValueError(f"Unknown mode type: {mode_type}")
+    return (src_list, dst_list, ts_list, node_count, node_list, maxTime_list, ngh_finder, pass_through_d_list, ptd_indices)
 
 
+def load_real_true(dataName):
+    path = f'./data/test/Real/scores/graph_{dataName}_bet.txt'
     g_df = pd.read_csv(path, names=['node_id', 'score'], sep=' ')
     test_nodeList = g_df['node_id'].astype(int).tolist()
     test_List = g_df['score'].tolist()
@@ -187,7 +165,7 @@ def load_real_true(dataName, mode_type, mode_value):
     return test_nodeList, test_List
 
 
-def load_real_train_true(mode_type, mode_value):
+def load_real_train_true():
     train_nodeList, train_true = [], []
 
     train_real_datasets = ['edit-mrwiktionary', 'edit-siwiktionary', 'edit-stwiktionary', 'edit-wowiktionary',
@@ -202,33 +180,13 @@ def load_real_train_true(mode_type, mode_value):
                            'edit-rwwiktionary', 'edit-stwikipedia', 'edit-olowikipedia', 'edit-tnwikipedia',
                            'edit-ffwikipedia', 'edit-dzwikipedia', 'edit-tyvwikipedia',
                            'edit-xhwikipedia',  'edit-tswikipedia', 'edit-bgwikiquote',
-                           'edit-idwikiquote', 'edit-aswikiquote', 'edit-yiwikiquote', 'edit-sawikiquote']
-
-    train_real_datasets = [f"sparse_temporal_ER_graph_{i}_seq" for i in range(44)]
+                            'edit-idwikiquote', 'edit-aswikiquote', 'edit-yiwikiquote', 'edit-sawikiquote']
 
     for index in range(len(train_real_datasets)):
         dataset_name = train_real_datasets[index]
+        
 
-        if mode_type == 'bet':
-            if mode_value == 'sh':
-                #path = f'./data/train/Real/scores/bc_scores/{dataset_name}_bc.txt'
-                path = f'./data/train/Real/scores/ER_sh_bet_scores/{dataset_name}_bc.txt'
-
-            elif mode_value == 'sfm':
-                path = f'./data/train/Real/scores/shf_scores/{dataset_name}_bc.txt'
-            else:
-                raise ValueError(f"Unknown betweenness mode: {mode_value}")
-        elif mode_type == 'close':
-            if mode_value == 'f':
-                path = f'./data/train/Real/scores/close_fast_scores/{dataset_name}_cl.txt'
-            elif mode_value == 'sh':
-                path = f'./data/train/Real/scores/close_sh_scores/{dataset_name}_sh_cl.txt'
-            else:
-                raise ValueError(f"Unknown closeness mode: {mode_value}")
-
-        else:
-            raise ValueError(f"Unknown mode type: {mode_type}")
-
+        path = f'./data/train/Real/scores/bc_scores/{dataset_name}_bc.txt'
         g_df = pd.read_csv(path, names=['node_id', 'score'], sep=' ')
 
         nodeList = g_df['node_id'].astype(int).tolist()
@@ -239,77 +197,36 @@ def load_real_train_true(mode_type, mode_value):
 
     return train_nodeList, train_true
 
-
 def preprocess_data(csv_file):
-    """
-    Reads a temporal graph from a CSV file and returns edge_index and edge_time tensors.
-
-    Args:
-        csv_file (str): Path to the CSV file.
-
-    Returns:
-        edge_index (torch.Tensor): Shape [2, num_edges], source and destination nodes.
-        edge_time (torch.Tensor): Shape [num_edges], timestamps for each edge.
-    """
-    # Read the CSV file, skip the first row (header), and use only necessary columns
     df = pd.read_csv(csv_file, skiprows=1, header=None, usecols=[1, 2, 3])
 
-    # Extract the source, destination, and time columns
     source_nodes = df.iloc[:, 0].tolist()
     destination_nodes = df.iloc[:, 1].tolist()
     timestamps = df.iloc[:, 2].tolist()
 
-    # Convert to PyTorch tensors
     edge_index = torch.tensor([source_nodes, destination_nodes], dtype=torch.long)
     edge_time = torch.tensor(timestamps, dtype=torch.float)
 
     return edge_index, edge_time
 
-def save_all_graph_features(train_real_datasets, mode_type, mode_value, save_dir="graph_features"):
+def save_all_graph_features(train_real_datasets, save_dir="graph_features"):
     os.makedirs(save_dir, exist_ok=True)
     graph_features = {
         "pass_through_d": None,
-        "earl_arrival": None,
-        "out_degree": None,
-        "out_reach": None
     }
 
     for dataset_name in train_real_datasets:
         file_path = os.path.join(save_dir, f"{dataset_name}_features.pkl")
-
-        #g_df = pd.read_csv(f'./data/train/Real/processed/seq/ml_{dataset_name}.csv')
-        g_df = pd.read_csv(f'./data/train/Real/processed/ER_15k/ml_edit-{dataset_name}.csv')
+        g_df = pd.read_csv(f'./data/train/Real/processed/seq/ml_{dataset_name}.csv')
 
         src, dst, ts = g_df['u'].values, g_df['i'].values, g_df['ts'].values
         num_nodes = len(set(np.unique(np.hstack([src, dst]))))
 
         temporal_edges = list(zip(src, dst, ts))
 
-        if mode_type == 'bet':
-            pass_through_d = pass_through_degree(temporal_edges, num_nodes)
-            pass_through_d = torch.tensor(pass_through_d, dtype=torch.float32)
-            graph_features["pass_through_d"] = pass_through_d
-
-            if mode_value == 'sfm':
-                earl_arrival = compute_earliest_arrival(num_nodes, src, dst, ts)
-                earl_arrival = torch.tensor(earl_arrival, dtype=torch.float32)
-                graph_features["earl_arrival"] = earl_arrival
-
-        elif mode_type == 'close':
-            if mode_value == 'f':
-                out_degree, _ = compute_temporal_degrees(temporal_edges, num_nodes)
-                out_degree = torch.tensor(out_degree, dtype=torch.float32)
-                graph_features["out_degree"] = out_degree
-
-            elif mode_value == 'sh':
-                out_reach = compute_temporal_out_reach(num_nodes, src, dst, ts)
-                out_reach = torch.tensor(out_reach, dtype=torch.float32)
-                graph_features["out_reach"] = out_reach
-
-            else:
-                raise ValueError(f"Unknown closeness mode: {mode_value}")
-        else:
-            raise ValueError(f"Unknown mode type: {mode_type}")
+        pass_through_d = pass_through_degree(temporal_edges, num_nodes)
+        pass_through_d = torch.tensor(pass_through_d, dtype=torch.float32)
+        graph_features["pass_through_d"] = pass_through_d
 
         with open(file_path, "wb") as f:
             pickle.dump(graph_features, f)
